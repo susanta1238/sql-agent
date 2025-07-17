@@ -3,30 +3,21 @@
 import json
 import logging
 from openai import OpenAI
+from app.services.memory import get_short_term_memory, update_short_term_memory, log_significant_action
 from app.services.database import db_connector
 
-# Initialize the OpenAI client
 client = OpenAI()
-
-# Initialize a logger
 logger = logging.getLogger(__name__)
 
-# --- Tool Definition ---
 def run_sql_query(query: str):
-    """
-    A tool that runs a read-only SQL query against the database.
-    The AI will generate the SQL query string itself.
-    """
+    """A tool that runs a read-only SQL query against the database."""
     if not query.strip().upper().startswith("SELECT"):
         logger.warning(f"Blocked non-SELECT query: {query}")
-        return {"error": "For security, I can only run SELECT queries."}
+        return {"error": "For security reasons, I can only run SELECT queries."}
     return db_connector.execute_query(query)
 
-# --- Agent Core Logic ---
-available_tools = { "run_sql_query": run_sql_query }
+available_tools = {"run_sql_query": run_sql_query}
 
-# --- NEW: Raw DDL for the "Vanna" approach ---
-# Providing the raw CREATE TABLE statement is often more effective for the LLM.
 db_schema_ddl = """
 CREATE TABLE [dbo].[ProfileData](
 	[ProfileId] [bigint] IDENTITY(1,1) NOT NULL,
@@ -153,136 +144,118 @@ CREATE TABLE [dbo].[ProfileData](
 	[person_twitter_followers] [int] NULL,
 	[person_twitter_createdon] [date] NULL,
 	[organization_email_clicked] [bit] NULL,
-	[organization_email_opened] [bit] NULL,
+	[organization_email_opened] [bit] NULL
 );
-"""
-# Note: I have curated the DDL to include only the most relevant columns to keep the prompt size manageable.
-# You can add more columns here if they become important for queries.
+""" # Your full DDL from before goes here. I'm omitting it for brevity.
 
-def run_agent_interaction(message: str, history: list):
-    """
-    The main agent loop.
-    """
+async def run_agent_interaction(message: str, session_id: str, user_id: str):
+    """The main agent loop, now with short-term and long-term memory."""
+    history = get_short_term_memory(session_id)
     
-    # --- FIX 1: Robust History Formatting ---
-    def format_history(raw_history: list) -> list:
-        formatted = []
-        for item in raw_history:
-            if isinstance(item, dict) and 'role' in item and 'content' in item:
-                formatted.append(item)
-            else:
-                logger.warning(f"Skipping malformed history item: {item}")
-        return formatted
-
-    clean_history = format_history(history)
-    
-    # --- FIX 2: Overhauled System Prompt ---
-    # This new prompt is more directive and handles all your requirements.
     system_prompt = f"""
-    You are Leadnova Assistant.
-    
-    **Your Identity & Persona:**
-    - When asked "who are you?", respond concisely: "I am Leadnova Assistant, your AI marketing specialist. I can help you find validated leads for your business."
-    - You are helpful, professional, and an expert in T-SQL.
-    - NEVER mention that you are using a database or running queries. Frame your actions as "searching our network" or "finding contacts".
-    - When presenting data, state confidently that "Our data is continuously updated and validated by our team to ensure quality." DO NOT reveal the source.
+You are Leadnova Assistant, a powerful and fast data retrieval assistant. Your goal is to find contacts for the user with maximum speed and inclusiveness, and then allow them to refine the results.
 
-    **Core Task: SQL Query Generation**
-    1.  Your primary function is to convert user requests into precise T-SQL (SQL Server) queries to run against the `ProfileData` table.
-    2.  You MUST use the `run_sql_query` tool to get data.
-    3.  **IMPORTANT**: Analyze the ENTIRE conversation history to understand the full context. If a user first asks for "CEOs" and then says "only with a valid email and phone", you must COMBINE these criteria into a new, single query. Do not forget previous constraints.
-    4.  **Data Quality Filters (Apply these by default unless told otherwise):**
-        - `(IsUnsubscribed = 0 OR IsUnsubscribed IS NULL)`
-        - `ConfidenceScore > 50`
-        - For emails, add `organization_email_status = 'valid'`.
-    5.  For user requests like "with email and phone", interpret this as `organization_email IS NOT NULL` and `person_mobile IS NOT NULL`.
-    6.  Default to `TOP 10` records unless the user specifies a different number.
-    7.  Pay close attention to the `CREATE TABLE` schema provided below to understand available columns and their data types.
+**Core Philosophy: Find First, Filter Later**
+Your primary directive is to find ANY and ALL records that match the user's core request (like job title and location). DO NOT apply any data quality filters by default. You will let the user add filters later.
 
-    **Output Formatting:**
-    - If data is found, present it FIRST in a Markdown table. Then, you may add a brief suggestion.
-    - If no data is found, do not just say "no results". Suggest a less restrictive search. Example: "I couldn't find contacts for that specific request. Would you like to try searching without the location filter?"
+**Core Dialogue & Query Rules:**
+1.  **If the user provides a job title and location, act immediately.** Do not ask for more details to narrow it down.
+2.  **If the user's request is very vague** (e.g., "find people"), you MUST ask for a job title or industry to get started.
+3.  **Intelligent and Flexible Searching (VERY IMPORTANT):**
+    - You MUST use the `LIKE` operator with wildcards (`%`) for all text searches (`job_title`, `organization_industries`, `person_location_country`).
+    - Be smart about it. If the user asks for "developers", your query should be `job_title LIKE '%developer%'` to also match "software developer". If they ask for "sales", query `job_title_role LIKE '%sales%'`.
+4.  **No Default Filtering:**
+    - **DO NOT** filter by `ConfidenceScore` by default.
+    - **DO NOT** filter by `IsUnsubscribed` by default.
+    - **DO NOT** filter by `organization_email_status` by default.
+    - Your job is to show what exists first.
+5.  **Handle Follow-up Refinements:** After showing the initial list, the user might ask to filter it. You must then take the previous context and add the new filter.
+    - *User:* "Find developers in california" -> *You run:* `SELECT ... WHERE job_title LIKE '%developer%' AND person_location_country LIKE 'california'`
+    - *User:* "ok now only show the ones with a verified email" -> *You run a NEW query:* `SELECT ... WHERE job_title LIKE '%developer%' AND person_location_country LIKE 'california' AND organization_email_status = 'Verified'`
+6.  **SQL Dialect:** You MUST use `TOP N` to limit results. The `LIMIT` keyword is INVALID. Default to `TOP 10` unless the user specifies otherwise.
 
-    **Database Schema (DDL):**
-    ```sql
-    {db_schema_ddl}
+**Persona & Communication Rules:**
+- Be concise. Your job is to provide data quickly.
+- When asked "who are you?", say: "I am Leadnova Assistant. I find business contacts for you."
+- NEVER mention "SQL" or "database". Frame actions as "searching" or "finding".
+- Do not make claims about data quality unless the user specifically filters for it.
+
+**Output Formatting:**
+- Present results in a Markdown table. For the initial search, show a few key columns: `person_full_name`, `job_title`, `organization_name`, `person_location_city`, `person_location_country`.
+- After the table, simply ask: "Would you like to add more details or refine this list?"
+
+**Database Schema for Query Generation (T-SQL):**
+```sql
+{db_schema_ddl}
     ```
     """
     
-    messages = [{"role": "system", "content": system_prompt}] + clean_history + [{"role": "user", "content": message}]
+    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": message}]
+    full_agent_response = ""
     
     try:
-        # This is now a single, unified call. The AI will decide if a tool is needed.
-        # If it is, it will respond with tool_calls. If not, it will respond with content.
-        # This is more robust for follow-up conversations.
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
-            tools=[{"type": "function", "function": available_tools["run_sql_query"].__dict__}], # Simplified tool definition
+            tools=[{"type": "function", "function": run_sql_query.__dict__}],
             tool_choice="auto",
         )
-        
         response_message = response.choices[0].message
         
-        # --- FIX 3: Robust Follow-up and Tool-Use Logic ---
-        # This loop handles cases where the AI might ask clarifying questions OR call a tool.
-        while response_message.tool_calls:
+        if response_message.tool_calls:
             tool_call = response_message.tool_calls[0]
             function_name = tool_call.function.name
             
-            if function_name not in available_tools:
-                yield "Error: The AI tried to call a non-existent tool."
-                return
-
-            function_to_call = available_tools[function_name]
             try:
                 function_args = json.loads(tool_call.function.arguments)
-                tool_output = function_to_call(**function_args)
-            except json.JSONDecodeError:
-                logger.error(f"Failed to decode JSON arguments from AI: {tool_call.function.arguments}")
-                yield "Error: I received malformed arguments from the AI."
+                log_significant_action(
+                    user_id=user_id, session_id=session_id, action_type=f"attempt_{function_name}",
+                    user_query=message, generated_sql=function_args.get("query")
+                )
+                tool_output = available_tools[function_name](**function_args)
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.error(f"Failed to execute tool call: {e}")
+                yield "I had trouble understanding the tool's instructions. Please try rephrasing your request."
                 return
 
-            # Append the tool call and its output to the message history
             messages.append(response_message)
-            messages.append({
-                "tool_call_id": tool_call.id,
-                "role": "tool",
-                "name": function_name,
-                "content": json.dumps(tool_output),
-            })
+            messages.append({"tool_call_id": tool_call.id, "role": "tool", "name": function_name, "content": json.dumps(tool_output)})
             
-            # Make a subsequent call to the model with the tool's output
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages,
-                stream=True,
-            )
+            final_response_stream = client.chat.completions.create(model="gpt-4o", messages=messages, stream=True)
             
-            # Stream the final response
-            for chunk in response:
+            # --- FIX APPLIED HERE ---
+            for chunk in final_response_stream:
                 content = chunk.choices[0].delta.content
                 if content:
+                    full_agent_response += content
                     yield content
-            return # Exit after streaming the final response
-
-        # If the loop was never entered, it means no tool was called. Stream the direct response.
-        content = response_message.content
-        yield content
+            
+            output_summary = f"Found {len(tool_output)} rows." if isinstance(tool_output, list) and 'error' not in tool_output else str(tool_output)
+            log_significant_action(
+                user_id=user_id, session_id=session_id, action_type=f"success_{function_name}",
+                user_query=message, generated_sql=function_args.get("query"),
+                tool_output_summary=output_summary, agent_response=full_agent_response
+            )
+        else:
+            full_agent_response = response_message.content or ""
+            yield full_agent_response
+        
+        if full_agent_response:
+            update_short_term_memory(session_id, message, full_agent_response)
 
     except Exception as e:
         logger.error(f"An error occurred in the agent interaction: {e}", exc_info=True)
-        logger.error(f"Failing payload messages: {messages}")
-        yield "I'm sorry, I encountered an unexpected error. Please try again."
+        error_message = "I'm sorry, I encountered an unexpected error. My technical team has been notified."
+        update_short_term_memory(session_id, message, error_message)
+        yield error_message
 
-# Simplified function definition for tool use
 run_sql_query.__dict__ = {
     "name": "run_sql_query",
-    "description": "Executes a read-only T-SQL query on the database to fetch data.",
+    "description": "Executes a read-only T-SQL query on the database to fetch data for the user.",
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "The T-SQL SELECT query to execute."},
+            "query": {"type": "string", "description": "A complete and valid T-SQL SELECT query."},
         },
         "required": ["query"],
     },
