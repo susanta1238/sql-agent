@@ -1,262 +1,230 @@
 # app/agent/core.py
-
 import json
 import logging
 from openai import OpenAI
 from app.services.memory import get_short_term_memory, update_short_term_memory, log_significant_action
 from app.services.database import db_connector
 
+# Initialize clients and logger
 client = OpenAI()
 logger = logging.getLogger(__name__)
 
-def run_sql_query(query: str):
-    """A tool that runs a read-only SQL query against the database."""
-    if not query.strip().upper().startswith("SELECT"):
-        logger.warning(f"Blocked non-SELECT query: {query}")
-        return {"error": "For security reasons, I can only run SELECT queries."}
-    return db_connector.execute_query(query)
 
-available_tools = {"run_sql_query": run_sql_query}
+# --- THE FINAL, DYNAMIC QUERY BUILDER TOOL ---
+def build_and_run_search_query(filters: list = None, columns_to_select: list = None):
+    """
+    Builds and executes a safe query from a dynamic list of filters and can select custom columns.
+    This is the heart of the agent's data access, providing both flexibility and security.
+    """
+    # Define a default set of columns for the initial view if none are specified
+    if not columns_to_select:
+        columns_to_select = [
+            "person_full_name", "job_title", "organization_name", 
+            "person_location_country", "organization_email", "person_email"
+        ]
+    
+    # Security Layer 1: Whitelist of all columns the AI is allowed to select or filter on.
+    allowed_columns = [
+        "ProfileId", "person_full_name", "job_title", "job_title_role", "organization_name",
+        "organization_industries", "person_location_city", "person_location_state", "person_location_country",
+        "organization_email", "person_email", "person_mobile", "person_phone", "person_linkedin_url",
+        "person_twitter_url", "person_github_url", "person_skills", 
+        "organization_email_status", "person_linkedin_connections" 
+    ]
+    
+    # Filter the requested columns against the allowlist to ensure safety
+    safe_columns = [col for col in columns_to_select if col in allowed_columns]
+    if not safe_columns: # Fallback if AI provides no valid columns
+        safe_columns = ["person_full_name", "job_title", "organization_name"]
+
+    select_clause = ", ".join(f"[{col}]" for col in safe_columns) # Add brackets for safety
+    query = f"SELECT TOP 10 {select_clause} FROM dbo.ProfileData"
+    
+    conditions, params = [], []
+    allowed_operators = ["LIKE", "=", "IS NOT NULL", "IS NULL", ">", "<"]
+
+    if filters:
+        for f in filters:
+            # Validate the filter object received from the AI
+            if not isinstance(f, dict) or not all(k in f for k in ["column", "operator", "value"]):
+                logger.warning(f"Skipping malformed filter from AI: {f}")
+                continue
+
+            column, operator, value = f["column"], f["operator"].upper(), f["value"]
+
+            # Security Layer 2: Validate the column and operator against allowlists
+            if column not in allowed_columns or operator not in allowed_operators:
+                logger.warning(f"Skipping filter with disallowed column or operator: {f}")
+                continue
+
+            if operator in ["IS NOT NULL", "IS NULL"]:
+                conditions.append(f"[{column}] {operator}")
+            else:
+                conditions.append(f"[{column}] {operator} ?")
+                params.append(value if operator != "LIKE" else f"%{value}%")
+    
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+
+    query += " ORDER BY person_full_name ASC;"
+    return db_connector.execute_query(query, tuple(params))
+
+
+# --- FINAL TOOL SCHEMA ---
+dynamic_query_schema = {
+    "type": "function",
+    "function": {
+        "name": "run_dynamic_query",
+        "description": "Searches for contacts using a list of filters and specifies which columns to return.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "array",
+                    "description": "List of filter objects: {'column': str, 'operator': str, 'value': str}",
+                    "items": { "type": "object", "properties": {
+                        "column": {"type": "string"}, "operator": {"type": "string"}, "value": {"type": "string"}
+                    }}
+                },
+                "columns_to_select": {
+                    "type": "array",
+                    "description": "List of exact column names to show in the result.",
+                    "items": {"type": "string"}
+                }
+            }
+        }
+    }
+}
+
+available_tools = {"run_dynamic_query": build_and_run_search_query}
 
 db_schema_ddl = """
 CREATE TABLE [dbo].[ProfileData](
 	[ProfileId] [bigint] IDENTITY(1,1) NOT NULL,
-	[created_by] [varchar](100) NULL,
 	[created_on] [datetime] NULL,
-	[data_source] [varchar](100) NULL,
-	[person_profile_headline] [varchar](8000) NULL,
-	[job_last_updated] [nvarchar](255) NULL,
-	[job_start_date] [nvarchar](255) NULL,
-	[job_summary] [nvarchar](max) NULL,
 	[job_title] [varchar](255) NULL,
 	[job_title_role] [varchar](255) NULL,
-	[job_title_sub_role] [varchar](255) NULL,
-	[job_title_levels] [varchar](255) NULL,
-	[organization_domain] [varchar](255) NULL,
+	[organization_name] [varchar](255) NULL,
 	[organization_email] [varchar](255) NULL,
 	[organization_email_status] [varchar](50) NULL,
-	[organization_email_validation_source] [varchar](100) NULL,
-	[organization_email_validation_date] [date] NULL,
-	[organization_email_last_opened_date] [datetime] NULL,
-	[organization_email_last_clicked_date] [datetime] NULL,
-	[organization_facebook_url] [varchar](255) NULL,
-	[organization_founded_year] [varchar](255) NULL,
-	[organization_location_address_line_2] [varchar](255) NULL,
-	[organization_location_city] [varchar](255) NULL,
-	[organization_location_city_state_country] [varchar](255) NULL,
-	[organization_location_continent] [varchar](255) NULL,
-	[organization_location_country] [varchar](255) NULL,
-	[organization_location_geo_code] [varchar](255) NULL,
-	[organization_location_postal_code] [varchar](255) NULL,
-	[organization_location_region] [varchar](255) NULL,
-	[organization_location_state_country] [varchar](255) NULL,
-	[organization_location_state_address] [varchar](255) NULL,
 	[organization_industries] [varchar](1000) NULL,
-	[organization_linkedin_id] [varchar](255) NULL,
 	[organization_linkedin_url] [varchar](255) NULL,
-	[organization_name] [varchar](255) NULL,
-	[organization_phone] [varchar](255) NULL,
-	[organization_phone_status] [varchar](50) NULL,
-	[organization_phone_validation_source] [varchar](100) NULL,
-	[organization_phone_validation_date] [datetime] NULL,
-	[organization_phone_last_communicated_date] [datetime] NULL,
 	[organization_size] [varchar](255) NULL,
-	[organization_twitter_url] [varchar](255) NULL,
-	[person_birth_date] [varchar](255) NULL,
-	[person_birth_year] [varchar](255) NULL,
 	[person_email] [varchar](500) NULL,
-	[person_email_status] [varchar](50) NULL,
-	[person_email_validation_source] [varchar](100) NULL,
-	[person_email_validation_date] [datetime] NULL,
-	[person_email_last_opened_date] [datetime] NULL,
-	[person_email_last_clicked_date] [datetime] NULL,
-	[person_facebook_id] [varchar](255) NULL,
-	[person_facebook_url] [varchar](255) NULL,
-	[person_facebook_url_status] [varchar](50) NULL,
-	[person_facebook_url_validation_source] [varchar](100) NULL,
-	[person_facebook_url_validation_date] [datetime] NULL,
-	[person_facebook_username] [varchar](255) NULL,
-	[person_first_name] [varchar](255) NULL,
-	[person_gender] [varchar](255) NULL,
-	[person_github_url] [varchar](255) NULL,
-	[person_github_username] [varchar](255) NULL,
-	[person_industries] [varchar](1000) NULL,
-	[person_inferred_salary] [varchar](255) NULL,
-	[person_inferred_years_experience] [varchar](255) NULL,
-	[person_interest] [varchar](1000) NULL,
-	[person_last_name] [varchar](255) NULL,
-	[person_linkedin_connections] [varchar](255) NULL,
-	[person_linkedin_id] [varchar](255) NULL,
-	[person_linkedin_url] [varchar](255) NULL,
-	[person_linkedin_url_status] [varchar](50) NULL,
-	[person_linkedin_url_validation_source] [varchar](100) NULL,
-	[person_linkedin_url_validation_date] [datetime] NULL,
-	[person_linkedin_url_last_communicated_date] [datetime] NULL,
-	[person_linkedin_username] [varchar](255) NULL,
-	[person_location_address_line_2] [varchar](255) NULL,
-	[person_location_city] [varchar](255) NULL,
-	[person_location_city_status_country] [varchar](255) NULL,
-	[person_location_continent] [varchar](255) NULL,
-	[person_location_country] [varchar](255) NULL,
-	[person_location_geo_code] [varchar](255) NULL,
-	[person_location_last_updated] [varchar](255) NULL,
-	[person_location_state_country] [varchar](255) NULL,
-	[person_location_postal_code] [varchar](255) NULL,
-	[person_location_state] [varchar](255) NULL,
-	[person_location_street_address] [varchar](255) NULL,
-	[person_middle_initial] [varchar](255) NULL,
-	[person_middle_name] [varchar](255) NULL,
-	[person_mobile] [varchar](255) NULL,
-	[person_mobile_status] [varchar](50) NULL,
-	[person_mobile_validation_source] [varchar](100) NULL,
-	[person_mobile_validation_date] [datetime] NULL,
-	[person_mobile_last_communicated_date] [datetime] NULL,
 	[person_full_name] [varchar](255) NULL,
+	[person_github_url] [varchar](255) NULL,
+	[person_linkedin_url] [varchar](255) NULL,
+    [person_linkedin_connections] [int] NULL,
+	[person_location_city] [varchar](255) NULL,
+	[person_location_country] [varchar](255) NULL,
+	[person_location_state] [varchar](255) NULL,
+	[person_mobile] [varchar](255) NULL,
 	[person_phone] [varchar](255) NULL,
-	[person_phone_status] [varchar](50) NULL,
-	[person_phone_validation_source] [varchar](100) NULL,
-	[person_phone_validation_date] [datetime] NULL,
-	[person_phone_last_communicated_date] [datetime] NULL,
-	[person_raw_number] [varchar](255) NULL,
 	[person_skills] [nvarchar](1000) NULL,
-	[person_twitter_url] [varchar](255) NULL,
-	[person_twitter_url_status] [varchar](50) NULL,
-	[person_twitter_url_validation_source] [varchar](100) NULL,
-	[person_twitter_url_validation_date] [datetime] NULL,
-	[person_twitter_username] [varchar](255) NULL,
-	[search_tags] [varchar](500) NULL,
-	[updated_by] [varchar](100) NULL,
-	[updated_on] [datetime] NULL,
-	[person_photo_url] [nvarchar](1000) NULL,
-	[organization_phone_sanitized] [varchar](255) NULL,
-	[ConfidenceScore] [int] NULL,
-	[PersonEmailScore] [int] NULL,
-	[OrganisationEmailScore] [int] NULL,
-	[PersonPhoneScore] [int] NULL,
-	[PersonMobileScore] [int] NULL,
-	[OrganisationPhoneScore] [int] NULL,
-	[PersonLinkedInScore] [int] NULL,
-	[DataBatch] [varchar](100) NULL,
-	[person_email_opened] [bit] NULL,
-	[person_email_clicked] [bit] NULL,
-	[IsUnsubscribed] [bit] NULL,
-	[Unsubscribed_on] [datetime] NULL,
-	[person_twitter_followers] [int] NULL,
-	[person_twitter_createdon] [date] NULL,
-	[organization_email_clicked] [bit] NULL,
-	[organization_email_opened] [bit] NULL
+	[person_twitter_url] [varchar](255) NULL
 );
-""" # Your full DDL from before goes here. I'm omitting it for brevity.
+""" # NOTE: This is a curated, shorter version for prompt efficiency. You can use your full DDL.
 
-async def run_agent_interaction(message: str, session_id: str, user_id: str):
-    """The main agent loop, now with short-term and long-term memory."""
+
+# --- THE MAIN AGENT INTERACTION FUNCTION ---
+async def run_agent_interaction(message: str, session_id: str, user_id: str) -> dict:
     history = get_short_term_memory(session_id)
     
     system_prompt = f"""
-You are Leadnova Assistant, a powerful and fast data retrieval assistant. Your goal is to find contacts for the user with maximum speed and inclusiveness, and then allow them to refine the results.
+    You are Leadnova Assistant, an expert data analyst. Your job is to translate user requests into parameters for the `run_dynamic_query` tool. You operate in two modes: Broad Search and Narrow Refinement.
+    never told user you are data analyst work as a data analyst but tell to find lead
 
-**Core Philosophy: Find First, Filter Later**
-Your primary directive is to find ANY and ALL records that match the user's core request (like job title and location). DO NOT apply any data quality filters by default. You will let the user add filters later.
+    **MODE 1: BROAD SEARCH (for initial industry requests)**
+    When the user first asks for a broad industry category, your most important task is to perform **semantic expansion**. Convert their broad request into a list of specific, related sub-industries to provide a comprehensive initial result.
 
-**Core Dialogue & Query Rules:**
-1.  **If the user provides a job title and location, act immediately.** Do not ask for more details to narrow it down.
-2.  **If the user's request is very vague** (e.g., "find people"), you MUST ask for a job title or industry to get started.
-3.  **Intelligent and Flexible Searching (VERY IMPORTANT):**
-    - You MUST use the `LIKE` operator with wildcards (`%`) for all text searches (`job_title`, `organization_industries`, `person_location_country`).
-    - Be smart about it. If the user asks for "developers", your query should be `job_title LIKE '%developer%'` to also match "software developer". If they ask for "sales", query `job_title_role LIKE '%sales%'`.
-4.  **No Default Filtering:**
-    - **DO NOT** filter by `ConfidenceScore` by default.
-    - **DO NOT** filter by `IsUnsubscribed` by default.
-    - **DO NOT** filter by `organization_email_status` by default.
-    - Your job is to show what exists first.
-5.  **Handle Follow-up Refinements:** After showing the initial list, the user might ask to filter it. You must then take the previous context and add the new filter.
-    - *User:* "Find developers in california" -> *You run:* `SELECT ... WHERE job_title LIKE '%developer%' AND person_location_country LIKE 'california'`
-    - *User:* "ok now only show the ones with a verified email" -> *You run a NEW query:* `SELECT ... WHERE job_title LIKE '%developer%' AND person_location_country LIKE 'california' AND organization_email_status = 'Verified'`
-6.  **SQL Dialect:** You MUST use `TOP N` to limit results. The `LIMIT` keyword is INVALID. Default to `TOP 10` unless the user specifies otherwise.
+    *Example of Broad Search:*
+    *User:* "give me data for businesses in the 'Health & Wellness' industry in the usa"
+    *Assistant's Action (Tool Call):*
+    ```json
+    {{
+      "filters": [
+        {{ "column": "person_location_country", "operator": "LIKE", "value": "united states" }}
+      ],
+      "organization_industries": [
+        "hospital & health care", "mental health care", "pharmaceuticals", "health, wellness and fitness", "medical devices"
+      ]
+    }}
+    ```
 
-**Persona & Communication Rules:**
-- Be concise. Your job is to provide data quickly.
-- When asked "who are you?", say: "I am Leadnova Assistant. I find business contacts for you."
-- NEVER mention "SQL" or "database". Frame actions as "searching" or "finding".
-- Do not make claims about data quality unless the user specifically filters for it.
+    **MODE 2: NARROW REFINEMENT (for follow-up requests)**
+    After providing an initial list, any follow-up from the user should be treated **literally**. You MUST retain all previous filters and add the new, literal filter or specify new columns.
 
-**Output Formatting:**
-- Present results in a Markdown table. For the initial search, show a few key columns: `person_full_name`, `job_title`, `organization_name`, `person_location_city`, `person_location_country`.
-- After the table, simply ask: "Would you like to add more details or refine this list?"
+    *Example of Narrow Refinement:*
+    *History:* The user just received a list of software engineers at Google.
+    *User:* "great, now show me their phone number and linkedin profile"
+    *Assistant's Action (Tool Call):*
+    ```json
+    {{
+      "filters": [
+        {{"column": "job_title", "operator": "LIKE", "value": "software engineer"}},
+        {{"column": "organization_name", "operator": "LIKE", "value": "Google"}}
+      ],
+      "columns_to_select": [ "person_full_name", "job_title", "person_mobile", "person_linkedin_url" ]
+    }}
+    ```
 
-**Database Schema for Query Generation (T-SQL):**
-```sql
-{db_schema_ddl}
+    **CRITICAL RULES:**
+    - Always analyze the full conversation history to determine your mode and retain context.
+    - NEVER show your thought process or the JSON tool call to the user.
+    - If the user's request is too vague, ask a clarifying question.
+
+    **Database Schema for finding column names:**
+    ```sql
+    {db_schema_ddl}
     ```
     """
     
     messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": message}]
-    full_agent_response = ""
     
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            tools=[{"type": "function", "function": run_sql_query.__dict__}],
-            tool_choice="auto",
-        )
+        response = client.chat.completions.create(model="gpt-4o", messages=messages, tools=[dynamic_query_schema], tool_choice="auto")
         response_message = response.choices[0].message
         
+        final_response_obj = {}
+
         if response_message.tool_calls:
             tool_call = response_message.tool_calls[0]
             function_name = tool_call.function.name
+            function_to_call = available_tools.get(function_name)
             
-            try:
+            if function_to_call:
                 function_args = json.loads(tool_call.function.arguments)
-                log_significant_action(
-                    user_id=user_id, session_id=session_id, action_type=f"attempt_{function_name}",
-                    user_query=message, generated_sql=function_args.get("query")
-                )
-                tool_output = available_tools[function_name](**function_args)
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.error(f"Failed to execute tool call: {e}")
-                yield "I had trouble understanding the tool's instructions. Please try rephrasing your request."
-                return
+                log_significant_action(user_id=user_id, session_id=session_id, action_type=f"attempt_{function_name}", user_query=message, generated_sql=str(function_args))
+                tool_output = function_to_call(**function_args)
 
-            messages.append(response_message)
-            messages.append({"tool_call_id": tool_call.id, "role": "tool", "name": function_name, "content": json.dumps(tool_output)})
-            
-            final_response_stream = client.chat.completions.create(model="gpt-4o", messages=messages, stream=True)
-            
-            # --- FIX APPLIED HERE ---
-            for chunk in final_response_stream:
-                content = chunk.choices[0].delta.content
-                if content:
-                    full_agent_response += content
-                    yield content
-            
-            output_summary = f"Found {len(tool_output)} rows." if isinstance(tool_output, list) and 'error' not in tool_output else str(tool_output)
-            log_significant_action(
-                user_id=user_id, session_id=session_id, action_type=f"success_{function_name}",
-                user_query=message, generated_sql=function_args.get("query"),
-                tool_output_summary=output_summary, agent_response=full_agent_response
-            )
+                if isinstance(tool_output, dict) and 'error' in tool_output:
+                    final_response_obj = {"type": "error_response", "content": f"Database error: {tool_output['error']}"}
+                elif not tool_output:
+                    final_response_obj = {"type": "text_response", "content": "I couldn't find any contacts matching that refined search. Please try removing a filter or using different keywords."}
+                else:
+                    summary_text = f"I've updated the list and found {len(tool_output)} contacts. Here are the details:"
+                    final_response_obj = {"type": "data_response", "content": {"summary": summary_text, "data": tool_output}}
+
+                output_summary = f"Found {len(tool_output)} rows." if isinstance(tool_output, list) else str(tool_output)
+                log_significant_action(user_id=user_id, session_id=session_id, action_type=f"success_{function_name}", user_query=message, generated_sql=str(function_args), tool_output_summary=output_summary, agent_response=json.dumps(final_response_obj))
+            else:
+                final_response_obj = {"type": "error_response", "content": "Internal error: AI tried an unknown tool."}
         else:
-            full_agent_response = response_message.content or ""
-            yield full_agent_response
+            full_agent_response = response_message.content or "I'm not sure how to respond to that."
+            final_response_obj = {"type": "text_response", "content": full_agent_response}
         
-        if full_agent_response:
-            update_short_term_memory(session_id, message, full_agent_response)
+        response_for_history = ""
+        response_type = final_response_obj.get("type")
+        if response_type == "data_response":
+            response_for_history = final_response_obj.get("content", {}).get("summary", "I have found some data for you.")
+        elif response_type in ["text_response", "error_response"]:
+            response_for_history = final_response_obj.get("content", "An unspecified error occurred.")
+        
+        if response_for_history:
+             update_short_term_memory(session_id, message, response_for_history)
+        
+        return final_response_obj
 
     except Exception as e:
-        logger.error(f"An error occurred in the agent interaction: {e}", exc_info=True)
-        error_message = "I'm sorry, I encountered an unexpected error. My technical team has been notified."
-        update_short_term_memory(session_id, message, error_message)
-        yield error_message
-
-run_sql_query.__dict__ = {
-    "name": "run_sql_query",
-    "description": "Executes a read-only T-SQL query on the database to fetch data for the user.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "A complete and valid T-SQL SELECT query."},
-        },
-        "required": ["query"],
-    },
-}
+        logger.error(f"An error occurred in agent interaction: {e}", exc_info=True)
+        return {"type": "error_response", "content": "I'm sorry, an unexpected error occurred."}
